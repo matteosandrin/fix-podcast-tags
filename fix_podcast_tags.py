@@ -12,7 +12,9 @@ import argparse
 import datetime as dt
 import hashlib
 import sqlite3
+import subprocess
 import sys
+import tempfile
 import urllib.request
 from pathlib import Path
 
@@ -24,6 +26,9 @@ from mutagen.id3 import (
 GROUP = Path.home() / "Library/Group Containers/243LU875E5.groups.com.apple.podcasts"
 CACHE_DIR = GROUP / "Library/Cache"
 DB_PATH = GROUP / "Documents/MTLibrary.sqlite"
+ART_DIR = CACHE_DIR / "Assets/Artwork"
+# The Podcasts app caches most artwork at this size.
+DEFAULT_ART_SIZE = 600
 
 # Core Data stores dates as seconds since 2001-01-01 UTC.
 CORE_DATA_EPOCH = dt.datetime(2001, 1, 1, tzinfo=dt.timezone.utc)
@@ -42,28 +47,55 @@ def open_db():
     return sqlite3.connect(DB_PATH.as_uri() + "?mode=ro", uri=True)
 
 
-def artwork_urls(row, size):
+def artwork_sources(row, size, use_cache):
+    # Yield cached files (Path) and URLs (str), best first.
     ep_template, pod_template, pod_image = row[8], row[13], row[14]
-    for template in (ep_template, pod_template):
-        if template:
-            yield template.replace("{w}", str(size)).replace("{h}", str(size)).replace("{f}", "jpg")
+    for kind, template in (("Episode", ep_template), ("Show", pod_template)):
+        if not template:
+            continue
+        if use_cache:
+            # The app names cached art by the MD5 of the template URL with its placeholders.
+            digest = hashlib.md5(template.encode()).hexdigest()
+            yield ART_DIR / f"{kind}-{digest}-{size}x{size}-bb.heic"
+        yield template.replace("{w}", str(size)).replace("{h}", str(size)).replace("{f}", "jpg")
     if pod_image:
         yield pod_image
+
+
+def read_cached_art(path):
+    if not path.exists():
+        return None
+    # The cache stores HEIC. iPods need JPEG.
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "art.jpg"
+        result = subprocess.run(
+            ["sips", "-s", "format", "jpeg", str(path), "--out", str(out)],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            print(f"  warn: sips failed for {path.name}: {result.stderr.strip()}", file=sys.stderr)
+            return None
+        return out.read_bytes()
+
+
+def download_art(url):
+    try:
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            return resp.read()
+    except Exception as exc:
+        print(f"  warn: artwork fetch failed for {url}: {exc}", file=sys.stderr)
+        return None
 
 
 _art_cache = {}
 
 
-def fetch_art(urls):
-    for url in urls:
-        if url not in _art_cache:
-            try:
-                with urllib.request.urlopen(url, timeout=30) as resp:
-                    _art_cache[url] = resp.read()
-            except Exception as exc:
-                print(f"  warn: artwork fetch failed for {url}: {exc}", file=sys.stderr)
-                _art_cache[url] = None
-        data = _art_cache[url]
+def fetch_art(sources):
+    for source in sources:
+        if source not in _art_cache:
+            load = read_cached_art if isinstance(source, Path) else download_art
+            _art_cache[source] = load(source)
+        data = _art_cache[source]
         if data and data[:3] == b"\xff\xd8\xff":
             return data, "image/jpeg"
         if data and data[:8] == b"\x89PNG\r\n\x1a\n":
@@ -71,7 +103,7 @@ def fetch_art(urls):
     return None, None
 
 
-def desired_frames(row, art_size):
+def desired_frames(row, art_size, use_cache):
     (_, title, ep_author, pubdate, ep_num, season, desc, guid, _,
      show, show_author, category, feed_url, _, _) = row
     when = None
@@ -100,7 +132,7 @@ def desired_frames(row, art_size):
     if feed_url:
         frames["WFED"] = WFED(url=feed_url)
 
-    art, mime = fetch_art(artwork_urls(row, art_size))
+    art, mime = fetch_art(artwork_sources(row, art_size, use_cache))
     if art:
         frames["APIC"] = APIC(encoding=3, mime=mime, type=3, desc="", data=art)
     return frames
@@ -127,7 +159,7 @@ def process(path, db, args):
         tags = ID3()
 
     changes = []
-    for key, new in desired_frames(row, args.art_size).items():
+    for key, new in desired_frames(row, args.art_size or DEFAULT_ART_SIZE, args.art_size is None).items():
         if key == "APIC":
             old_frames = tags.getall("APIC")
             old = old_frames[0] if len(old_frames) == 1 else None
@@ -172,7 +204,10 @@ def process(path, db, args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--dry-run", action="store_true", help="show changes, write nothing")
-    parser.add_argument("--art-size", type=int, default=600, help="artwork edge in px (default 600)")
+    parser.add_argument(
+        "--art-size", type=int,
+        help=f"download artwork at this edge in px, skip the local cache (default {DEFAULT_ART_SIZE})",
+    )
     args = parser.parse_args()
 
     files = sorted(CACHE_DIR.glob("*.mp3"))

@@ -29,8 +29,10 @@ Those tags come straight from the publisher and are often wrong or missing, for 
    the episode number (as the track) and the season (as the disc).
 3. Writes the iTunes podcast frames: podcast flag, category, description, GUID and feed URL.
    The genre is always set to `Podcast`.
-4. Downloads the artwork that the Podcasts app shows as a
-   600x600 JPEG and embeds it in place of any existing pictures.
+4. Embeds the artwork that the Podcasts app shows as a 600x600 JPEG, in place of any
+   existing pictures. It reads the artwork from the app's cache
+   (`Library/Cache/Assets/Artwork`), converts it from HEIC with `sips`, and only downloads
+   it if it is not in the cache.
 5. Saves the tags as ID3v2.3, the version that iPod sync tools support best.
 
 Note:
@@ -56,7 +58,7 @@ Options:
 | Option         | Description                                    |
 | -------------- | ---------------------------------------------- |
 | `--dry-run`    | Print the changes for each file, write nothing |
-| `--art-size N` | Artwork size in pixels (default `600`)         |
+| `--art-size N` | Download artwork at N pixels, skip the cache   |
 
 After the script finishes, sync your iPod as usual.
 
